@@ -1,0 +1,16 @@
+{
+  "name": "rpiv-advisor",
+  "version": "0.1.0",
+  "description": "Pi extension: advisor-strategy pattern — escalate to a stronger reviewer model",
+  "keywords": ["pi-package", "pi-extension", "rpiv", "advisor"],
+  "type": "module",
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*",
+    "@sinclair/typebox": "*"
+  }
+}
