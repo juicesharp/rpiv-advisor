@@ -7,7 +7,7 @@ resume.
 
 ## Installation
 
-    pi install npm:rpiv-advisor
+    pi install npm:@juicesharp/rpiv-advisor
 
 Then restart your Pi session.
 

@@ -1,9 +1,22 @@
 {
-  "name": "rpiv-advisor",
+  "name": "@juicesharp/rpiv-advisor",
   "version": "0.1.0",
   "description": "Pi extension: advisor-strategy pattern — escalate to a stronger reviewer model",
   "keywords": ["pi-package", "pi-extension", "rpiv", "advisor"],
   "type": "module",
+  "license": "MIT",
+  "author": "juicesharp",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/juicesharp/rpiv-advisor.git"
+  },
+  "homepage": "https://github.com/juicesharp/rpiv-advisor#readme",
+  "bugs": {
+    "url": "https://github.com/juicesharp/rpiv-advisor/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "pi": {
     "extensions": ["./index.ts"]
   },
