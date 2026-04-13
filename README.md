@@ -5,6 +5,8 @@ implementing the advisor-strategy pattern: the executor model can escalate
 decisions to a stronger reviewer model (e.g. Opus), receive guidance, and
 resume.
 
+![Advisor model selector](https://raw.githubusercontent.com/juicesharp/rpiv-advisor/main/docs/advisor.jpg)
+
 ## Installation
 
     pi install npm:@juicesharp/rpiv-advisor
