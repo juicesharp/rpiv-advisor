@@ -28,13 +28,6 @@ disable.
 conversation branch to the advisor model, which returns guidance (plan,
 correction, or stop signal) that the executor consumes.
 
-## Migration from rpiv-pi ≤ 0.3.0
-
-If you had an advisor configured while rpiv-pi bundled this tool, your previous
-selection lived at `~/.config/rpiv-pi/advisor.json`. The new plugin reads
-`~/.config/rpiv-advisor/advisor.json` only — run `/advisor` once to re-select
-your model.
-
 ## License
 
 MIT
