@@ -16,10 +16,10 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { completeSimple, supportsXhigh, type Message, type ThinkingLevel } from "@mariozechner/pi-ai";
 import type { Api, Model, StopReason, Usage } from "@mariozechner/pi-ai";
 import {
-	DynamicBorder,
 	convertToLlm,
 	serializeConversation,
 	type AgentToolResult,
@@ -28,20 +28,66 @@ import {
 	type ExtensionContext,
 	type SessionEntry,
 } from "@mariozechner/pi-coding-agent";
-import {
-	Container,
-	SelectList,
-	Spacer,
-	Text,
-	type SelectItem,
-} from "@mariozechner/pi-tui";
+import type { SelectItem } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
+import { showAdvisorPicker, showEffortPicker } from "./advisor-ui.js";
 
 // ---------------------------------------------------------------------------
-// Constants
+// Constants — grouped by concern, flat named consts (no namespaced objects)
 // ---------------------------------------------------------------------------
 
+// Tool identity
 export const ADVISOR_TOOL_NAME = "advisor";
+const TOOL_LABEL = "Advisor";
+
+// Persistence
+const CONFIG_DIR = join(homedir(), ".config", "rpiv-advisor");
+const ADVISOR_CONFIG_PATH = join(CONFIG_DIR, "advisor.json");
+const CONFIG_FILE_MODE = 0o600;
+
+// Selector sentinels — double-underscore form is collision-proof against real provider:id keys
+const NO_ADVISOR_VALUE = "__no_advisor__";
+const OFF_VALUE = "__off__";
+
+// Effort levels
+const BASE_EFFORT_LEVELS: ThinkingLevel[] = ["minimal", "low", "medium", "high"];
+const XHIGH_EFFORT_LEVEL: ThinkingLevel = "xhigh";
+const DEFAULT_EFFORT: ThinkingLevel = "high";
+const RECOMMENDED_EFFORT_SUFFIX = "  (recommended)";
+
+// UI — labels used by command flow; panel prose/titles live in advisor-ui.ts
+const CHECKMARK = " ✓";
+
+// Messages (static)
+const MSG_ADVISOR_DISABLED = "Advisor disabled";
+const MSG_REQUIRES_INTERACTIVE = "/advisor requires interactive mode";
+
+// Errors (static)
+const ERR_NO_MODEL =
+	"No advisor model is configured. The user can enable one with the /advisor command.";
+const ERR_CALL_ABORTED = "Advisor call was cancelled before it completed.";
+const ERR_EMPTY_RESPONSE = "Advisor returned no text content.";
+const ERR_NO_MODEL_SELECTED = "no advisor model selected";
+const ERR_EMPTY_RESPONSE_DETAIL = "empty response";
+const ERR_ABORTED_DETAIL = "aborted";
+const ERR_UNKNOWN = "unknown error";
+
+// Errors/messages (parameterized)
+const errMisconfigured = (label: string, err: string) =>
+	`Advisor (${label}) is misconfigured: ${err}`;
+const errNoApiKey = (label: string) => `Advisor (${label}) has no API key available.`;
+const errNoApiKeyDetail = (provider: string) => `no API key for ${provider}`;
+const errCallFailed = (err: string | undefined) => `Advisor call failed: ${err ?? ERR_UNKNOWN}`;
+const errCallThrew = (msg: string) => `Advisor call threw: ${msg}`;
+const errSelectionNotFound = (choice: string) => `Advisor selection not found: ${choice}`;
+const errModelUnavailable = (key: string) =>
+	`Previously configured advisor model ${key} is no longer available`;
+const msgAdvisorEnabled = (label: string, effort: ThinkingLevel | undefined) =>
+	`Advisor: ${label}${effort ? `, ${effort}` : ""}`;
+const msgAdvisorRestored = (label: string, effort: ThinkingLevel | undefined) =>
+	`Advisor restored: ${label}${effort ? `, ${effort}` : ""}`;
+const msgConsulting = (label: string, effort: ThinkingLevel | undefined) =>
+	`Consulting advisor (${label}${effort ? `, ${effort}` : ""})…`;
 
 // ---------------------------------------------------------------------------
 // Config file persistence (cross-session)
@@ -51,8 +97,6 @@ interface AdvisorConfig {
 	modelKey?: string;
 	effort?: ThinkingLevel;
 }
-
-const ADVISOR_CONFIG_PATH = join(homedir(), ".config", "rpiv-advisor", "advisor.json");
 
 function loadAdvisorConfig(): AdvisorConfig {
 	if (!existsSync(ADVISOR_CONFIG_PATH)) return {};
@@ -74,7 +118,7 @@ function saveAdvisorConfig(key: string | undefined, effort: ThinkingLevel | unde
 		// write may fail on disk-full or permission errors — best effort only
 	}
 	try {
-		chmodSync(ADVISOR_CONFIG_PATH, 0o600);
+		chmodSync(ADVISOR_CONFIG_PATH, CONFIG_FILE_MODE);
 	} catch {
 		// chmod may fail on some filesystems — best effort only
 	}
@@ -86,26 +130,14 @@ function parseModelKey(key: string): { provider: string; modelId: string } | und
 	return { provider: key.slice(0, idx), modelId: key.slice(idx + 1) };
 }
 
-export const ADVISOR_SYSTEM_PROMPT = `You are an advisor model in an advisor-strategy pattern. An executor model is running a task end-to-end — calling tools, reading results, iterating toward a solution. When the executor hits a decision it cannot reasonably solve alone, it consults you for guidance.
-
-You read the shared conversation context and return ONE of:
-- a plan (concrete next steps the executor should take),
-- a correction (the executor is going down a wrong path — redirect it),
-- a stop signal (the executor should halt and escalate to the user).
-
-You NEVER call tools. You NEVER produce user-facing output. Be concise, directive, and grounded in the shared context. Name files, functions, and line numbers where possible. No preamble, no apologies, no meta-commentary about being an advisor — just the guidance the executor needs.`;
-
 // ---------------------------------------------------------------------------
-// Types
+// System prompt — loaded once at module init from prompts/advisor-system.txt
 // ---------------------------------------------------------------------------
 
-export interface AdvisorDetails {
-	advisorModel?: string;
-	effort?: ThinkingLevel;
-	usage?: Usage;
-	stopReason?: StopReason;
-	errorMessage?: string;
-}
+export const ADVISOR_SYSTEM_PROMPT = readFileSync(
+	fileURLToPath(new URL("./prompts/advisor-system.txt", import.meta.url)),
+	"utf-8",
+).trimEnd();
 
 // ---------------------------------------------------------------------------
 // Module state — in-memory, resets each session
@@ -144,10 +176,7 @@ export function restoreAdvisorState(ctx: ExtensionContext, pi: ExtensionAPI): vo
 	const model = ctx.modelRegistry.find(parsed.provider, parsed.modelId);
 	if (!model) {
 		if (ctx.hasUI) {
-			ctx.ui.notify(
-				`Previously configured advisor model ${config.modelKey} is no longer available`,
-				"warning",
-			);
+			ctx.ui.notify(errModelUnavailable(config.modelKey), "warning");
 		}
 		return;
 	}
@@ -163,16 +192,21 @@ export function restoreAdvisorState(ctx: ExtensionContext, pi: ExtensionAPI): vo
 	}
 
 	if (ctx.hasUI) {
-		ctx.ui.notify(
-			`Advisor restored: ${model.provider}:${model.id}${config.effort ? `, ${config.effort}` : ""}`,
-			"info",
-		);
+		ctx.ui.notify(msgAdvisorRestored(`${model.provider}:${model.id}`, config.effort), "info");
 	}
 }
 
 // ---------------------------------------------------------------------------
 // Core execute logic — curate context, call advisor, return structured result
 // ---------------------------------------------------------------------------
+
+export interface AdvisorDetails {
+	advisorModel?: string;
+	effort?: ThinkingLevel;
+	usage?: Usage;
+	stopReason?: StopReason;
+	errorMessage?: string;
+}
 
 function buildErrorResult(
 	advisorLabel: string | undefined,
@@ -195,29 +229,20 @@ async function executeAdvisor(
 ): Promise<AgentToolResult<AdvisorDetails>> {
 	const advisor = getAdvisorModel();
 	if (!advisor) {
-		return buildErrorResult(
-			undefined,
-			"No advisor model is configured. The user can enable one with the /advisor command.",
-			"no advisor model selected",
-		);
+		return buildErrorResult(undefined, ERR_NO_MODEL, ERR_NO_MODEL_SELECTED);
 	}
 	const advisorLabel = `${advisor.provider}:${advisor.id}`;
 	const effort = getAdvisorEffort();
 
 	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(advisor);
 	if (!auth.ok) {
-		return buildErrorResult(
-			advisorLabel,
-			`Advisor (${advisorLabel}) is misconfigured: ${auth.error}`,
-			auth.error,
-		);
+		return buildErrorResult(advisorLabel, errMisconfigured(advisorLabel, auth.error), auth.error);
 	}
 	if (!auth.apiKey) {
-		const msg = `no API key for ${advisor.provider}`;
 		return buildErrorResult(
 			advisorLabel,
-			`Advisor (${advisorLabel}) has no API key available.`,
-			msg,
+			errNoApiKey(advisorLabel),
+			errNoApiKeyDetail(advisor.provider),
 		);
 	}
 
@@ -239,7 +264,7 @@ async function executeAdvisor(
 	};
 
 	onUpdate?.({
-		content: [{ type: "text", text: `Consulting advisor (${advisorLabel}${effort ? `, ${effort}` : ""})…` }],
+		content: [{ type: "text", text: msgConsulting(advisorLabel, effort) }],
 		details: { advisorModel: advisorLabel, effort },
 	});
 
@@ -252,27 +277,20 @@ async function executeAdvisor(
 
 		if (response.stopReason === "aborted") {
 			return {
-				content: [
-					{ type: "text", text: "Advisor call was cancelled before it completed." },
-				],
+				content: [{ type: "text", text: ERR_CALL_ABORTED }],
 				details: {
 					advisorModel: advisorLabel,
 					effort,
 					usage: response.usage,
 					stopReason: response.stopReason,
-					errorMessage: response.errorMessage ?? "aborted",
+					errorMessage: response.errorMessage ?? ERR_ABORTED_DETAIL,
 				},
 			};
 		}
 
 		if (response.stopReason === "error") {
 			return {
-				content: [
-					{
-						type: "text",
-						text: `Advisor call failed: ${response.errorMessage ?? "unknown error"}`,
-					},
-				],
+				content: [{ type: "text", text: errCallFailed(response.errorMessage) }],
 				details: {
 					advisorModel: advisorLabel,
 					effort,
@@ -291,13 +309,13 @@ async function executeAdvisor(
 
 		if (!advisorText) {
 			return {
-				content: [{ type: "text", text: "Advisor returned no text content." }],
+				content: [{ type: "text", text: ERR_EMPTY_RESPONSE }],
 				details: {
 					advisorModel: advisorLabel,
 					effort,
 					usage: response.usage,
 					stopReason: response.stopReason,
-					errorMessage: "empty response",
+					errorMessage: ERR_EMPTY_RESPONSE_DETAIL,
 				},
 			};
 		}
@@ -313,11 +331,7 @@ async function executeAdvisor(
 		};
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
-		return buildErrorResult(
-			advisorLabel,
-			`Advisor call threw: ${message}`,
-			message,
-		);
+		return buildErrorResult(advisorLabel, errCallThrew(message), message);
 	}
 }
 
@@ -350,7 +364,7 @@ const ADVISOR_PROMPT_GUIDELINES: string[] = [
 export function registerAdvisorTool(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: ADVISOR_TOOL_NAME,
-		label: "Advisor",
+		label: TOOL_LABEL,
 		description: ADVISOR_DESCRIPTION,
 		promptSnippet: ADVISOR_PROMPT_SNIPPET,
 		promptGuidelines: ADVISOR_PROMPT_GUIDELINES,
@@ -381,27 +395,6 @@ export function registerAdvisorBeforeAgentStart(pi: ExtensionAPI): void {
 // /advisor slash command — opens selector panel for picking the advisor model
 // ---------------------------------------------------------------------------
 
-const ADVISOR_HEADER_TITLE = "Advisor Tool";
-
-const ADVISOR_HEADER_PROSE_1 =
-	"When the active model needs stronger judgment — a complex decision, an ambiguous " +
-	"failure, a problem it's circling without progress — it escalates to the " +
-	"advisor model for guidance, then resumes. The advisor runs server-side " +
-	"and uses additional tokens.";
-
-const ADVISOR_HEADER_PROSE_2 =
-	"For certain workloads, pairing a faster model as the main model with a " +
-	"more capable one as the advisor gives near-top-tier performance with " +
-	"reduced token usage.";
-
-const NO_ADVISOR_VALUE = "__no_advisor__";
-
-const EFFORT_HEADER_TITLE = "Reasoning Level";
-
-const EFFORT_HEADER_PROSE =
-	"Choose the reasoning effort level for the advisor. " +
-	"Higher levels produce stronger judgment but use more tokens.";
-
 function modelKey(m: { provider: string; id: string }): string {
 	return `${m.provider}:${m.id}`;
 }
@@ -411,7 +404,7 @@ export function registerAdvisorCommand(pi: ExtensionAPI): void {
 		description: "Configure the advisor model for the advisor-strategy pattern",
 		handler: async (_args, ctx) => {
 			if (!ctx.hasUI) {
-				ctx.ui.notify("/advisor requires interactive mode", "error");
+				ctx.ui.notify(MSG_REQUIRES_INTERACTIVE, "error");
 				return;
 			}
 
@@ -421,74 +414,15 @@ export function registerAdvisorCommand(pi: ExtensionAPI): void {
 
 			const items: SelectItem[] = availableModels.map((m) => {
 				const key = modelKey(m);
-				const check = key === currentKey ? " ✓" : "";
+				const check = key === currentKey ? CHECKMARK : "";
 				return { value: key, label: `${m.name}  (${m.provider})${check}` };
 			});
 			items.push({
 				value: NO_ADVISOR_VALUE,
-				label: currentKey === undefined ? "No advisor ✓" : "No advisor",
+				label: currentKey === undefined ? `No advisor${CHECKMARK}` : "No advisor",
 			});
 
-			const choice = await ctx.ui.custom<string | null>(
-				(tui, theme, _kb, done) => {
-					const container = new Container();
-
-					container.addChild(
-						new DynamicBorder((s: string) => theme.fg("accent", s)),
-					);
-					container.addChild(new Spacer(1));
-					container.addChild(
-						new Text(
-							theme.fg("accent", theme.bold(ADVISOR_HEADER_TITLE)),
-							1,
-							0,
-						),
-					);
-					container.addChild(new Spacer(1));
-					container.addChild(new Text(ADVISOR_HEADER_PROSE_1, 1, 0));
-					container.addChild(new Spacer(1));
-					container.addChild(new Text(ADVISOR_HEADER_PROSE_2, 1, 0));
-					container.addChild(new Spacer(1));
-
-					const selectList = new SelectList(
-						items,
-						Math.min(items.length, 10),
-						{
-							selectedPrefix: (t) => theme.bg("selectedBg", theme.fg("accent", t)),
-							selectedText: (t) => theme.bg("selectedBg", theme.bold(t)),
-							description: (t) => theme.fg("muted", t),
-							scrollInfo: (t) => theme.fg("dim", t),
-							noMatch: (t) => theme.fg("warning", t),
-						},
-					);
-					selectList.onSelect = (item) => done(item.value);
-					selectList.onCancel = () => done(null);
-					container.addChild(selectList);
-
-					container.addChild(new Spacer(1));
-					container.addChild(
-						new Text(
-							theme.fg("dim", "↑↓ navigate • enter select • esc cancel"),
-							1,
-							0,
-						),
-					);
-					container.addChild(new Spacer(1));
-					container.addChild(
-						new DynamicBorder((s: string) => theme.fg("accent", s)),
-					);
-
-					return {
-						render: (w) => container.render(w),
-						invalidate: () => container.invalidate(),
-						handleInput: (data) => {
-							selectList.handleInput(data);
-							tui.requestRender();
-						},
-					};
-				},
-			);
-
+			const choice = await showAdvisorPicker(ctx, items);
 			if (!choice) {
 				return;
 			}
@@ -505,100 +439,41 @@ export function registerAdvisorCommand(pi: ExtensionAPI): void {
 						activeTools.filter((n) => n !== ADVISOR_TOOL_NAME),
 					);
 				}
-				ctx.ui.notify("Advisor disabled", "info");
+				ctx.ui.notify(MSG_ADVISOR_DISABLED, "info");
 				return;
 			}
 
 			const picked = availableModels.find((m) => modelKey(m) === choice);
 			if (!picked) {
-				ctx.ui.notify(`Advisor selection not found: ${choice}`, "error");
+				ctx.ui.notify(errSelectionNotFound(choice), "error");
 				return;
 			}
 
 			// Effort picker — only for reasoning-capable models
 			let effortChoice: ThinkingLevel | undefined;
 			if (picked.reasoning) {
-				const OFF_VALUE = "__off__";
-				const baseLevels: ThinkingLevel[] = ["minimal", "low", "medium", "high"];
 				const levels = supportsXhigh(picked)
-					? [...baseLevels, "xhigh" as ThinkingLevel]
-					: baseLevels;
+					? [...BASE_EFFORT_LEVELS, XHIGH_EFFORT_LEVEL]
+					: BASE_EFFORT_LEVELS;
 
 				const effortItems: SelectItem[] = [
 					{ value: OFF_VALUE, label: "off" },
 					...levels.map((level) => ({
 						value: level,
-						label: level === "high" ? `${level}  (recommended)` : level,
+						label: level === DEFAULT_EFFORT ? `${level}${RECOMMENDED_EFFORT_SUFFIX}` : level,
 					})),
 				];
 
-				const effortResult = await ctx.ui.custom<string | null>(
-					(tui, theme, _kb, done) => {
-						const container = new Container();
-
-						container.addChild(
-							new DynamicBorder((s: string) => theme.fg("accent", s)),
-						);
-						container.addChild(new Spacer(1));
-						container.addChild(
-							new Text(
-								theme.fg("accent", theme.bold(EFFORT_HEADER_TITLE)),
-								1,
-								0,
-							),
-						);
-						container.addChild(new Spacer(1));
-						container.addChild(new Text(EFFORT_HEADER_PROSE, 1, 0));
-						container.addChild(new Spacer(1));
-
-						const selectList = new SelectList(
-							effortItems,
-							Math.min(effortItems.length, 10),
-							{
-								selectedPrefix: (t) => theme.bg("selectedBg", theme.fg("accent", t)),
-								selectedText: (t) => theme.bg("selectedBg", theme.bold(t)),
-								description: (t) => theme.fg("muted", t),
-								scrollInfo: (t) => theme.fg("dim", t),
-								noMatch: (t) => theme.fg("warning", t),
-							},
-						);
-						const currentEffort = getAdvisorEffort();
-						const defaultIdx = currentEffort
-							? effortItems.findIndex((item) => item.value === currentEffort)
-							: -1;
-						selectList.setSelectedIndex(defaultIdx >= 0 ? defaultIdx : effortItems.findIndex((item) => item.value === "high"));
-						selectList.onSelect = (item) => done(item.value);
-						selectList.onCancel = () => done(null);
-						container.addChild(selectList);
-
-						container.addChild(new Spacer(1));
-						container.addChild(
-							new Text(
-								theme.fg("dim", "↑↓ navigate • enter select • esc cancel"),
-								1,
-								0,
-							),
-						);
-						container.addChild(new Spacer(1));
-						container.addChild(
-							new DynamicBorder((s: string) => theme.fg("accent", s)),
-						);
-
-						return {
-							render: (w) => container.render(w),
-							invalidate: () => container.invalidate(),
-							handleInput: (data) => {
-								selectList.handleInput(data);
-								tui.requestRender();
-							},
-						};
-					},
+				const effortResult = await showEffortPicker(
+					ctx,
+					effortItems,
+					getAdvisorEffort(),
+					DEFAULT_EFFORT,
 				);
-
 				if (!effortResult) {
 					return;
 				}
-				effortChoice = effortResult === OFF_VALUE ? undefined : effortResult as ThinkingLevel;
+				effortChoice = effortResult === OFF_VALUE ? undefined : (effortResult as ThinkingLevel);
 			}
 
 			setAdvisorEffort(effortChoice);
@@ -607,10 +482,7 @@ export function registerAdvisorCommand(pi: ExtensionAPI): void {
 			if (!activeHas) {
 				pi.setActiveTools([...activeTools, ADVISOR_TOOL_NAME]);
 			}
-			ctx.ui.notify(
-				`Advisor: ${picked.provider}:${picked.id}${effortChoice ? `, ${effortChoice}` : ""}`,
-				"info",
-			);
+			ctx.ui.notify(msgAdvisorEnabled(modelKey(picked), effortChoice), "info");
 		},
 	});
 }

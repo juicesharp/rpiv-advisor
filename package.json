@@ -17,6 +17,13 @@
   "publishConfig": {
     "access": "public"
   },
+  "files": [
+    "index.ts",
+    "advisor.ts",
+    "advisor-ui.ts",
+    "prompts/",
+    "README.md"
+  ],
   "pi": {
     "extensions": ["./index.ts"]
   },
