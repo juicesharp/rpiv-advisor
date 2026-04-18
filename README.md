@@ -1,5 +1,7 @@
 # rpiv-advisor
 
+> **Moved to [`juicesharp/rpiv-mono`](https://github.com/juicesharp/rpiv-mono).** This package now lives at [`packages/rpiv-advisor`](https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-advisor) inside the rpiv-mono monorepo. Still published as `@juicesharp/rpiv-advisor` on npm (no install change). New issues and PRs belong on `rpiv-mono`; this repo is read-only going forward.
+
 Pi extension that registers the `advisor` tool and `/advisor` slash command,
 implementing the advisor-strategy pattern: the executor model can escalate
 decisions to a stronger reviewer model (e.g. Opus), receive guidance, and
